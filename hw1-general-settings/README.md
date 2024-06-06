@@ -127,7 +127,7 @@ statement latencies in milliseconds and failures:
          2.765           0  END;
 ```
 
-## Новые настройки 
+## Новые настройки
 
 Используется конфигуратор https://pgconfigurator.cybertec.at
 
