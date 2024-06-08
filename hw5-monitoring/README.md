@@ -158,7 +158,9 @@ DDL и параметры индекса
 
 ## pg_stat_statements
 
-Для отслеживания статистики выполнения запросов нужно загрузить модуль
+Для отслеживания статистики выполнения запросов нужно загрузить модуль-расширение
+
+Расширение имеет ряд настраиваемых параметров через postgresql.conf
 ```
 alter system set shared_preload_libraries='pg_stat_statements';
 restart
@@ -184,3 +186,148 @@ postgres=# SELECT query, calls, total_exec_time, rows, 100.0 * shared_blks_hit /
  select count(*) from test1 t1 join test2 t2 on t1.u1::text!=t2.u1::text where t1.u1::text like $1 |     1 |        71240.32012 |      1 | 100.0000000000000000 |         0
  update test1 set u1=gen_random_uuid() where u1::text like $1                                      |     1 |        1765.123279 | 300000 |  99.9995780501698348 |  94913759
 ```
+
+## Table bloat или раздувание таблиц
+
+С помощью такого запроса можно оценить степень заполненности датафайлов в пользовательских тейблспейсах
+
+Результат не совпадает с данными из PPEM, но в целом задает направление для дальнейшего исследования
+
+```
+/* WARNING: executed with a non-superuser role, the query inspect only tables and materialized view (9.3+) you are granted to read.
+* This query is compatible with PostgreSQL 9.0 and more
+*/
+SELECT current_database(), schemaname, tblname, bs*tblpages AS real_size,
+  (tblpages-est_tblpages)*bs AS extra_size,
+  CASE WHEN tblpages > 0 AND tblpages - est_tblpages > 0
+    THEN 100 * (tblpages - est_tblpages)/tblpages::float
+    ELSE 0
+  END AS extra_pct, fillfactor,
+  CASE WHEN tblpages - est_tblpages_ff > 0
+    THEN (tblpages-est_tblpages_ff)*bs
+    ELSE 0
+  END AS bloat_size,
+  CASE WHEN tblpages > 0 AND tblpages - est_tblpages_ff > 0
+    THEN 100 * (tblpages - est_tblpages_ff)/tblpages::float
+    ELSE 0
+  END AS bloat_pct, is_na
+  -- , tpl_hdr_size, tpl_data_size, (pst).free_percent + (pst).dead_tuple_percent AS real_frag -- (DEBUG INFO)
+FROM (
+  SELECT ceil( reltuples / ( (bs-page_hdr)/tpl_size ) ) + ceil( toasttuples / 4 ) AS est_tblpages,
+    ceil( reltuples / ( (bs-page_hdr)*fillfactor/(tpl_size*100) ) ) + ceil( toasttuples / 4 ) AS est_tblpages_ff,
+    tblpages, fillfactor, bs, tblid, schemaname, tblname, heappages, toastpages, is_na
+    -- , tpl_hdr_size, tpl_data_size, pgstattuple(tblid) AS pst -- (DEBUG INFO)
+  FROM (
+    SELECT
+      ( 4 + tpl_hdr_size + tpl_data_size + (2*ma)
+        - CASE WHEN tpl_hdr_size%ma = 0 THEN ma ELSE tpl_hdr_size%ma END
+        - CASE WHEN ceil(tpl_data_size)::int%ma = 0 THEN ma ELSE ceil(tpl_data_size)::int%ma END
+      ) AS tpl_size, bs - page_hdr AS size_per_block, (heappages + toastpages) AS tblpages, heappages,
+      toastpages, reltuples, toasttuples, bs, page_hdr, tblid, schemaname, tblname, fillfactor, is_na
+      -- , tpl_hdr_size, tpl_data_size
+    FROM (
+      SELECT
+        tbl.oid AS tblid, ns.nspname AS schemaname, tbl.relname AS tblname, tbl.reltuples,
+        tbl.relpages AS heappages, coalesce(toast.relpages, 0) AS toastpages,
+        coalesce(toast.reltuples, 0) AS toasttuples,
+        coalesce(substring(
+          array_to_string(tbl.reloptions, ' ')
+          FROM 'fillfactor=([0-9]+)')::smallint, 100) AS fillfactor,
+        current_setting('block_size')::numeric AS bs,
+        CASE WHEN version()~'mingw32' OR version()~'64-bit|x86_64|ppc64|ia64|amd64' THEN 8 ELSE 4 END AS ma,
+        24 AS page_hdr,
+        23 + CASE WHEN MAX(coalesce(s.null_frac,0)) > 0 THEN ( 7 + count(s.attname) ) / 8 ELSE 0::int END
+           + CASE WHEN bool_or(att.attname = 'oid' and att.attnum < 0) THEN 4 ELSE 0 END AS tpl_hdr_size,
+        sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 0) ) AS tpl_data_size,
+        bool_or(att.atttypid = 'pg_catalog.name'::regtype)
+          OR sum(CASE WHEN att.attnum > 0 THEN 1 ELSE 0 END) <> count(s.attname) AS is_na
+      FROM pg_attribute AS att
+        JOIN pg_class AS tbl ON att.attrelid = tbl.oid
+        JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+        LEFT JOIN pg_stats AS s ON s.schemaname=ns.nspname
+          AND s.tablename = tbl.relname AND s.inherited=false AND s.attname=att.attname
+        LEFT JOIN pg_class AS toast ON tbl.reltoastrelid = toast.oid
+      WHERE NOT att.attisdropped
+        AND tbl.relkind in ('r','m')
+      GROUP BY 1,2,3,4,5,6,7,8,9,10
+      ORDER BY 2,3
+    ) AS s
+  ) AS s2
+) AS s3
+WHERE schemaname not like 'pg_%' and schemaname != 'information_schema'
+-- WHERE NOT is_na
+--   AND tblpages*((pst).free_percent + (pst).dead_tuple_percent)::float4/100 >= 1
+ORDER BY schemaname, tblname;
+
+ current_database | schemaname |     tblname      | real_size | extra_size |     extra_pct      | fillfactor | bloat_size |     bloat_pct      | is_na 
+------------------+------------+------------------+-----------+------------+--------------------+------------+------------+--------------------+-------
+ postgres         | public     | pgbench_accounts |  15204352 |    1957888 | 12.877155172413794 |        100 |    1957888 | 12.877155172413794 | f
+ postgres         | public     | pgbench_branches |     24576 |      16384 |  66.66666666666667 |        100 |      16384 |  66.66666666666667 | f
+ postgres         | public     | pgbench_history  |     90112 |       8192 |  9.090909090909092 |        100 |       8192 |  9.090909090909092 | f
+ postgres         | public     | pgbench_tellers  |     40960 |      32768 |                 80 |        100 |      32768 |                 80 | f
+ postgres         | public     | test1            | 262152192 |  229736448 |  87.63476141370582 |        100 |  229736448 |  87.63476141370582 | f
+ postgres         | public     | test2            |  32768000 |     270336 |              0.825 |        100 |     270336 |              0.825 | f
+```
+Скрипт со stackoverflow для пересоздания раздутых таблиц уменьшил размер таблицы test1 с 250 до 30 Мб
+```
+postgres=# CREATE OR REPLACE FUNCTION admin.repack_table(text)
+RETURNS text
+AS $$
+DECLARE SQL text;
+BEGIN
+    SELECT
+      'CREATE TEMP TABLE t1 (LIKE '||$1||');'||chr(10)||
+      'INSERT INTO t1 SELECT * FROM '||$1||';'||chr(10)||
+      'TRUNCATE TABLE '||$1||';'||chr(10)||
+      'INSERT INTO '||$1||' SELECT * FROM t1;'||chr(10)||
+      'DROP TABLE t1;'||chr(10)||
+      'ANALYZE '||$1||';'
+    INTO SQL;
+    EXECUTE SQL;
+    RETURN $1;
+END;
+$$ LANGUAGE plpgsql;
+
+-- repack all tables in certain schema (with an optional threshold for N of dead tuples)
+CREATE OR REPLACE FUNCTION admin.repack_schema(text,int default 5000)
+RETURNS table (table_name text)
+AS $$
+DECLARE SQL text;
+BEGIN
+RETURN QUERY (
+    with schema as (select $1)
+    select admin.repack_table(t.table_schema||'.'||t.table_name)
+    from information_schema.tables t
+    where t.table_schema=(select * from schema)
+    and t.table_name in (
+        select relname
+        from pg_stat_all_tables
+        where schemaname=(select * from schema)
+        and n_dead_tup>$2
+        and n_live_tup<1000000 -- avoid repacking too large tables
+    )
+);
+END;
+$$ LANGUAGE plpgsql;
+
+postgres=# select public.repack_schema('public');
+ repack_schema 
+---------------
+(0 rows)
+
+ current_database | schemaname |     tblname      | real_size | extra_size |     extra_pct      | fillfactor | bloat_size |     bloat_pct      | is_na 
+------------------+------------+------------------+-----------+------------+--------------------+------------+------------+--------------------+-------
+ postgres         | public     | pgbench_accounts |  15204352 |    1957888 | 12.877155172413794 |        100 |    1957888 | 12.877155172413794 | f
+ postgres         | public     | pgbench_branches |     24576 |      16384 |  66.66666666666667 |        100 |      16384 |  66.66666666666667 | f
+ postgres         | public     | pgbench_history  |     90112 |       8192 |  9.090909090909092 |        100 |       8192 |  9.090909090909092 | f
+ postgres         | public     | pgbench_tellers  |     40960 |      32768 |                 80 |        100 |      32768 |                 80 | f
+ postgres         | public     | test1            |  32768000 |     270336 |              0.825 |        100 |     270336 |              0.825 | f
+ postgres         | public     | test2            |  32768000 |     270336 |              0.825 |        100 |     270336 |              0.825 | f
+```
+
+Ссылки
+
+- https://postgrespro.ru/docs/postgresql/15/pgstatstatements
+- https://wiki.postgresql.org/wiki/Show_database_bloat
+- https://habr.com/ru/articles/169939/
+- https://stackoverflow.com/questions/59456694/table-bloat-on-postgres
