@@ -95,7 +95,7 @@ postgres=# \l
  template1          | postgres      | UTF8     | C       | C     |            | libc            | =c/postgres          +
                     |               |          |         |       |            |                 | postgres=CTc/postgres
 ```
-Теперь всё работает
+Репозиторий инициализирован
 ```
 # init-pgpro-manager-repo --conf /etc/pgpro-manager.conf
 repo user: pgpro_manager
@@ -156,3 +156,31 @@ DDL и параметры индекса
 
 ![](img/img5.png)
 
+## pg_stat_statements
+
+Для отслеживания статистики выполнения запросов нужно загрузить модуль
+```
+alter system set shared_preload_libraries='pg_stat_statements';
+restart
+```
+Пример использования
+```
+postgres=# SELECT pg_stat_statements_reset();
+
+postgres=# select count(*) from test1 t1 join test2 t2 on t1.u1::text!=t2.u1::text where t1.u1::text like '%000%';
+   count   
+-----------
+ 418500000
+(1 row)
+
+postgres=# update test1 set u1=gen_random_uuid() where u1::text like '%';
+UPDATE 300000
+
+postgres=# SELECT query, calls, total_exec_time, rows, 100.0 * shared_blks_hit /
+               nullif(shared_blks_hit + shared_blks_read, 0) AS hit_percent, wal_bytes
+          FROM pg_stat_statements ORDER BY 3 DESC LIMIT 5;\G
+                                               query                                               | calls |  total_exec_time   |  rows  |     hit_percent      | wal_bytes 
+---------------------------------------------------------------------------------------------------+-------+--------------------+--------+----------------------+-----------
+ select count(*) from test1 t1 join test2 t2 on t1.u1::text!=t2.u1::text where t1.u1::text like $1 |     1 |        71240.32012 |      1 | 100.0000000000000000 |         0
+ update test1 set u1=gen_random_uuid() where u1::text like $1                                      |     1 |        1765.123279 | 300000 |  99.9995780501698348 |  94913759
+```
